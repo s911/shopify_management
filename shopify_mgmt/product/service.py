@@ -63,7 +63,7 @@ def empty_manual_input_rows(n: int) -> pd.DataFrame:
             d[c] = [pd.NA] * n
         else:
             d[c] = [""] * n
-    return pd.DataFrame(d)
+    return coerce_manual_df_for_streamlit_editor(pd.DataFrame(d))
 
 
 def resize_manual_input_dataframe(existing: pd.DataFrame, n: int) -> pd.DataFrame:
@@ -76,9 +76,30 @@ def resize_manual_input_dataframe(existing: pd.DataFrame, n: int) -> pd.DataFram
             df[c] = pd.NA if c == "Variant Price" else ""
     df = df[MANUAL_TEMPLATE_COLUMNS]
     if len(df) >= n:
-        return df.iloc[:n].reset_index(drop=True)
-    pad = empty_manual_input_rows(n - len(df))
-    return pd.concat([df.reset_index(drop=True), pad], ignore_index=True)
+        out = df.iloc[:n].reset_index(drop=True)
+    else:
+        pad = empty_manual_input_rows(n - len(df))
+        out = pd.concat([df.reset_index(drop=True), pad], ignore_index=True)
+    return coerce_manual_df_for_streamlit_editor(out)
+
+
+def coerce_manual_df_for_streamlit_editor(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    统一列类型，减轻 st.data_editor 在 Tab 切换单元格时丢字的问题。
+    文本列用 pandas StringDtype；价格用 float64（空为 NaN）。
+    """
+    out = df.reindex(columns=list(MANUAL_TEMPLATE_COLUMNS)).copy()
+    for c in MANUAL_TEMPLATE_COLUMNS:
+        if c == "Variant Price":
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
+        else:
+            s = out[c].map(
+                lambda x: ""
+                if x is None or (isinstance(x, float) and pd.isna(x)) or (isinstance(x, str) and x.lower() == "nan")
+                else str(x)
+            )
+            out[c] = s.astype("string")
+    return out
 
 
 def _strip_columns(df: pd.DataFrame) -> pd.DataFrame:

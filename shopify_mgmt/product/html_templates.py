@@ -12,16 +12,22 @@ import pandas as pd
 
 TEMPLATE_PREFIX = """
 <p><strong>For Small Orders (&lt;50kg):</strong><br>
-Please select the quantity and checkout directly. We maintain steady stock for fast shipping.</p>
+Please select the quantity and check out directly. We maintain steady stock for fast shipping.</p>
 <p><strong>For Bulk Inquiries (&gt;400kg):</strong><br>
-Contact our sales team via WhatApp or Eamil Us for exclusive FOB/CIF pricing and customized logistics solutions.</p>
+Contact our sales team via <strong>WhatsApp</strong> or email for exclusive FOB/CIF pricing and tailored logistics.</p>
 """
 
 TEMPLATE_SUFFIX = """
 <!-- Shopify Fabric Policy Accordion -->
+<style>
+.fabric-policy-section summary::-webkit-details-marker { display: none; }
+.fabric-policy-section summary { list-style: none; }
+.fabric-policy-section .acc-indicator::before { content: "+"; font-weight: 700; }
+.fabric-policy-section details[open] .acc-indicator::before { content: "-"; }
+</style>
 <div style="margin-top: 20px; font-size: 0.9em; line-height: 1.6; color: #333;" class="fabric-policy-section">
 <details style="border-bottom: 1px solid #eee; padding: 10px 0; cursor: pointer;" open="">
-<summary style="font-weight: bold; list-style: none; display: flex; justify-content: space-between; align-items: center;">1. Shipping &amp; Samples <span>+</span></summary>
+<summary style="font-weight: bold; list-style: none; display: flex; justify-content: space-between; align-items: center;">1. Shipping &amp; Samples <span class="acc-indicator"></span></summary>
 <div style="padding: 10px 5px; color: #666;">
 <ul>
 <li><strong>Dispatch:</strong> In-stock items ship within 48 business hours.</li>
@@ -30,7 +36,7 @@ TEMPLATE_SUFFIX = """
 </div>
 </details>
 <details style="border-bottom: 1px solid #eee; padding: 10px 0; cursor: pointer;">
-<summary style="font-weight: bold; list-style: none; display: flex; justify-content: space-between; align-items: center;">2. Quality &amp; Batch Variations <span>+</span></summary>
+<summary style="font-weight: bold; list-style: none; display: flex; justify-content: space-between; align-items: center;">2. Quality &amp; Batch Variations <span class="acc-indicator"></span></summary>
 <div style="padding: 10px 5px; color: #666;">
 <ul>
 <li><strong>Consistency:</strong> Minor variations in texture and thickness are inherent between different production batches.</li>
@@ -40,7 +46,7 @@ TEMPLATE_SUFFIX = """
 </div>
 </details>
 <details style="border-bottom: 1px solid #eee; padding: 10px 0; cursor: pointer;">
-<summary style="font-weight: bold; list-style: none; display: flex; justify-content: space-between; align-items: center;">3. Packaging &amp; Returns <span>+</span></summary>
+<summary style="font-weight: bold; list-style: none; display: flex; justify-content: space-between; align-items: center;">3. Packaging &amp; Returns <span class="acc-indicator"></span></summary>
 <div style="padding: 10px 5px; color: #666;">
 <ul>
 <li><strong>Packaging:</strong> Bulk orders are rolled and double-packed for protection.</li>

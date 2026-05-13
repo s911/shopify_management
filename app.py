@@ -11,7 +11,6 @@ import streamlit as st
 
 from shopify_mgmt.db import init_db
 from shopify_mgmt.product.service import (
-    build_manual_template_dataframe,
     export_products_dataframe,
     generate_matrixify_dataframe,
     import_dataframe,
@@ -19,6 +18,7 @@ from shopify_mgmt.product.service import (
     to_csv_bytes,
     to_excel_bytes,
 )
+from shopify_mgmt.product.tag_engine import build_bulk_import_template_dataframe
 
 MENU = (
     "产品导入导出",
@@ -38,7 +38,7 @@ def page_product_io() -> None:
     exp = export_products_dataframe()
     c1, c2, c3 = st.columns(3)
     with c1:
-        tpl = build_manual_template_dataframe()
+        tpl = build_bulk_import_template_dataframe()
         st.download_button(
             "下载空白模板（Excel）",
             data=to_excel_bytes(tpl),

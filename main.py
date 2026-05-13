@@ -1,4 +1,5 @@
 import io
+import re
 
 import streamlit as st
 import pandas as pd
@@ -28,16 +29,18 @@ from shopify_mgmt.db import (
 )
 from shopify_mgmt.knowledge_base import render_knowledge_base
 from shopify_mgmt.product.service import (
-    MANUAL_TEMPLATE_COLUMNS,
-    build_manual_template_dataframe,
-    empty_manual_input_rows,
     generate_matrixify_dataframe,
     read_table_file,
-    resize_manual_input_dataframe,
     to_excel_bytes,
-    validate_manual_template_required,
+)
+from shopify_mgmt.product.tag_engine import (
+    PRODUCT_TYPE_OPTIONS,
+    apply_tag_engine_to_bulk_dataframe,
+    build_bulk_import_template_dataframe,
+    run_tag_engine,
 )
 from shopify_mgmt.rmb_cn import format_rmb_cn, insert_readable_rmb_column
+
 
 # 设置页面风格
 st.set_page_config(
@@ -45,6 +48,97 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _auto_format_note_body(raw_text: str) -> str:
+    """把粘贴进来的纯文本整理成更清晰的纯文本层次结构。"""
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    # 句号/分号后自动断行，解决整段粘贴成一行的问题
+    text = re.sub(r"(?<=[。；;])(?=\S)", "\n", text)
+    # 中文大标题（如：一、二、）前断行
+    text = re.sub(r"(?<!\n)([一二三四五六七八九十百]+、)", r"\n\1", text)
+    # 数字编号（如：1. / 2) / 3、）前断行
+    text = re.sub(r"(?<!\n)(\d{1,2}[.)、])\s*", r"\n\1 ", text)
+    lines = [ln.strip() for ln in text.split("\n")]
+    out: list[str] = []
+
+    def _append_with_gap(line: str, *, gap: bool = False) -> None:
+        if gap and out and out[-1] != "":
+            out.append("")
+        out.append(line)
+
+    def _is_heading_line(s: str) -> bool:
+        if re.match(r"^[一二三四五六七八九十百]+、", s):
+            return True
+        if re.match(r"^\d{1,2}[.)、]\s*", s):
+            return True
+        if (s.endswith(":") or s.endswith("：")) and len(s) <= 40:
+            return True
+        return False
+
+    for line in lines:
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+
+        # 清洗常见 Markdown 符号，避免粘贴后保留 ### / ** / - 等标记
+        line = re.sub(r"^#{1,6}\s*", "", line)  # heading 前缀
+        line = re.sub(r"^\s*[-*]\s+(?=\*\*|[A-Za-z0-9\u4e00-\u9fff])", "", line)  # 列表前缀
+        line = line.replace("**", "")  # 粗体标记
+        line = re.sub(r"^[•·]\s*", "", line)  # 圆点前缀
+        line = line.strip()
+        if not line:
+            continue
+
+        # 一级层次：中文章节（如“一、 纤维成分”）
+        if re.match(r"^[一二三四五六七八九十百]+、", line):
+            _append_with_gap(line, gap=True)
+            continue
+
+        # 二级层次：数字编号（如“1. 天然纤维”）
+        m_num = re.match(r"^(\d{1,2})[.)、]\s*(.+)$", line)
+        if m_num:
+            _append_with_gap(f"{m_num.group(1)}. {m_num.group(2).strip()}", gap=True)
+            continue
+
+        # 三级层次：短标题（如“发货说明:” / “发货说明：”）
+        if (line.endswith(":") or line.endswith("：")) and len(line) <= 40:
+            _append_with_gap(line, gap=True)
+            continue
+
+        # 常见项目符号 -> 统一成纯文本缩进
+        if line.startswith(("-", "*", "•", "·")):
+            item = line[1:].strip()
+            _append_with_gap(f"  {item}" if item else "")
+            continue
+
+        # “术语：解释” -> 标题行 + 缩进子项
+        if "：" in line and not line.startswith("#"):
+            left, right = line.split("：", 1)
+            left = left.strip()
+            right = right.strip()
+            if 1 <= len(left) <= 40 and right:
+                _append_with_gap(f"{left}：", gap=True)
+                # 将逗号分隔的长串拆成缩进子项，增强层次感
+                sub_items = [x.strip() for x in re.split(r"[，,]\s*", right) if x.strip()]
+                if len(sub_items) >= 2:
+                    for s in sub_items:
+                        _append_with_gap(f"    {s}")
+                else:
+                    _append_with_gap(f"  {right}")
+                continue
+
+        # 普通正文：如果前一行是标题，则与正文间留一行
+        if out and _is_heading_line(out[-1]):
+            _append_with_gap(line, gap=True)
+        else:
+            _append_with_gap(line)
+
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
 
 
 def render_notebook_page() -> None:
@@ -56,6 +150,16 @@ def render_notebook_page() -> None:
         st.session_state.nb_title = ""
     if "nb_body" not in st.session_state:
         st.session_state.nb_body = ""
+    if "nb_format_pending" not in st.session_state:
+        st.session_state.nb_format_pending = False
+    if "nb_body_formatted" not in st.session_state:
+        st.session_state.nb_body_formatted = ""
+    if "nb_reset_pending" not in st.session_state:
+        st.session_state.nb_reset_pending = False
+    if st.session_state.get("nb_reset_pending"):
+        st.session_state.nb_title = ""
+        st.session_state.nb_body = ""
+        st.session_state.nb_reset_pending = False
 
     st.title("记事本")
     st.caption("记录保存在本机数据库 `data/shopify_mgmt.sqlite3` 的 `notes` 表中。")
@@ -105,14 +209,28 @@ def render_notebook_page() -> None:
                 help="按需拉高正文框，便于长文书写",
             )
             st.text_input("标题", key="nb_title", placeholder="可选，一句话概括")
+            if st.session_state.get("nb_format_pending"):
+                st.session_state.nb_body = st.session_state.get("nb_body_formatted", "")
+                st.session_state.nb_format_pending = False
             st.text_area("正文", key="nb_body", height=int(body_h), placeholder="随手记录…")
 
-            c1, c2, _ = st.columns([1, 1, 3])
+            c1, c2, c3, _ = st.columns([1, 1, 1.2, 2.8])
             with c1:
                 do_save = st.button("保存", type="primary", key="nb_save")
             with c2:
                 can_del = st.session_state.note_editing_id is not None
                 do_delete = st.button("删除", type="secondary", key="nb_delete", disabled=not can_del)
+            with c3:
+                do_fmt = st.button("一键整理格式", key="nb_format")
+
+        if do_fmt:
+            body_old = st.session_state.get("nb_body") or ""
+            if not body_old.strip():
+                st.warning("正文为空，无需整理。")
+            else:
+                st.session_state.nb_body_formatted = _auto_format_note_body(body_old)
+                st.session_state.nb_format_pending = True
+                st.rerun()
 
         if do_save:
             title = (st.session_state.get("nb_title") or "").strip()
@@ -147,9 +265,7 @@ def render_notebook_page() -> None:
             finally:
                 conn.close()
             st.session_state.note_editing_id = None
-            st.session_state.nb_title = ""
-            st.session_state.nb_body = ""
-            st.success("已删除")
+            st.session_state.nb_reset_pending = True
             st.rerun()
 
 
@@ -619,37 +735,54 @@ elif menu == "知识库":
     render_knowledge_base()
 
 elif menu == "产品导入":
-    st.title("产品导入 → Matrixify Excel")
-    st.caption(
-        "在线表格与 Excel 二选一或组合使用：合并默认值并写入 Body (HTML)；"
-        "描述按 Tags：含 **Fleece** → 抓绒；含 **Stretch** 或 **Yoga** → 弹力；否则 **Knit** 针织。"
-    )
+    st.title("产品录入与 Matrixify 导出")
+    st.caption("在线录入支持多行（默认 10 行），`Product Type` 与补充 `Tag` 使用下拉选择；批量模板已精简并保留 Product Type 必填。")
 
-    with st.expander("字段说明", expanded=False):
+    type_ctl, tag_ctl = st.columns(2)
+    with type_ctl:
+        add_new_type = st.checkbox("Add New Type", value=False, key="add_new_type_switch")
+        new_type_text = ""
+        if add_new_type:
+            new_type_text = (st.text_input("New Product Type", key="add_new_type_text", placeholder="例如 Waffle Knit") or "").strip()
+    with tag_ctl:
+        add_new_tag = st.checkbox("Add New Tag", value=False, key="add_new_tag_switch")
+        new_tag_text = ""
+        if add_new_tag:
+            new_tag_text = (st.text_input("New Tag", key="add_new_tag_text", placeholder="例如 Soft Touch") or "").strip()
+
+    type_options = list(PRODUCT_TYPE_OPTIONS)
+    if new_type_text and new_type_text not in type_options:
+        type_options.append(new_type_text)
+        st.success(f"已添加新 Product Type：{new_type_text}")
+    tag_options = [
+        "Fleece",
+        "Stretch",
+        "Yoga",
+        "Heavyweight",
+        "Midweight",
+        "Lightweight",
+        "Sustainable",
+        "Ready-to-Ship",
+        "Sample-Available",
+    ]
+    if new_tag_text and new_tag_text not in tag_options:
+        tag_options.append(new_tag_text)
+        st.success(f"已添加新 Tag：{new_tag_text}")
+
+    with st.expander("字段与规则说明", expanded=False):
         st.markdown(
             """
-- **在线表格**：与下载模板相同的 **7 个字段**，当前设置的每一行均为 **必填**（默认 10 行即 10 条产品）。
-- **上传 Excel**：列名需与模板一致；空单元格仍会用系统默认值填充（与历史简表逻辑一致）。
-- 生成文件建议命名：`Import_Product_Matrixify.xlsx`，导入 Matrixify 前请再核对 HTS/MOQ 等。
+- 在线多行：默认 10 行，可改行数；`Product Type` 与 `Tag` 采用下拉。
+- `Product Type` 是必填字段（在线与批量都校验）。
+- 批量模板仅保留核心列，不再出现多余 I/J 列。
+- 最终 `Tags` 统一经引擎生成（自动包含 Product Type，并与下拉 Tag 合并）。
             """
         )
 
-    c1, c2 = st.columns(2)
-    with c1:
-        tpl = build_manual_template_dataframe()
-        st.download_button(
-            label="下载简表模板（Excel）",
-            data=to_excel_bytes(tpl),
-            file_name="Product_Info_Before_Import.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    with c2:
-        st.info("模板列与在线表格一致，共 7 列；在线模式下每一行都必须填完整。")
-
     force_tpl = st.checkbox(
-        "始终根据合并后的 Tags 套用 Fleece / Stretch / Knit 模板（推荐）",
+        "始终根据最终 Tags 重新套用 Body (HTML) 模板（推荐）",
         value=True,
-        help="关闭后：仅当表中有 Tags 列且该行 Tags 非空时，才按 Tags 更新 Body (HTML)。",
+        key="matrixify_force_body",
     )
 
     def _run_matrixify(df_src: pd.DataFrame, *, from_label: str) -> None:
@@ -658,7 +791,7 @@ elif menu == "产品导入":
         st.session_state.pop("matrixify_preview", None)
         out_df, warns = generate_matrixify_dataframe(
             df_src,
-            force_body_from_tags=force_tpl,
+            force_body_from_tags=st.session_state.get("matrixify_force_body", True),
             skip_rows_without_handle=True,
         )
         for w in warns:
@@ -671,85 +804,232 @@ elif menu == "产品导入":
             st.session_state["matrixify_preview"] = out_df
             st.success(f"已从{from_label}生成 {len(out_df)} 行，可下载下方 Excel。")
 
-    tab_online, tab_excel = st.tabs(["在线填写（模板全必填）", "上传 Excel"])
+    st.subheader("在线多行录入")
+    n_rows = int(st.number_input("产品行数", min_value=1, max_value=60, value=10, step=1, key="multi_rows"))
+    st.caption("默认 10 行；留空行会自动跳过。")
 
-    with tab_online:
-        st.markdown(
-            f"下方表格共 **{len(MANUAL_TEMPLATE_COLUMNS)}** 列，与模板一致；"
-            "请设置「产品行数」后逐行填写，**全部格子填完**再点生成。"
-        )
-        n_rows = st.number_input(
-            "产品行数（每条产品一行）",
-            min_value=1,
-            max_value=50,
-            value=10,
-            step=1,
-            help="默认 10 行；改行数会截断末尾或向下补齐空行。",
-        )
-        if "online_df" not in st.session_state:
-            st.session_state.online_df = empty_manual_input_rows(int(n_rows))
-        resized = resize_manual_input_dataframe(st.session_state.online_df, int(n_rows))
-        edited = st.data_editor(
-            resized,
-            column_config={
-                "Handle": st.column_config.TextColumn("Handle", required=True, width="medium"),
-                "Title": st.column_config.TextColumn("Title", required=True, width="large"),
-                "Tags": st.column_config.TextColumn("Tags", required=True, help="含 Fleece / Stretch / Yoga 等以匹配描述模板", width="medium"),
-                "Variant Price": st.column_config.NumberColumn(
-                    "Variant Price",
-                    required=True,
-                    min_value=0.0,
-                    format="%.2f",
-                    step=0.01,
-                ),
-                "Metafield: custom.gsm [string]": st.column_config.TextColumn("GSM", required=True, width="small"),
-                "Metafield: custom.width [string]": st.column_config.TextColumn("幅宽", required=True, width="small"),
-                "Metafield: custom.composition [string]": st.column_config.TextColumn("成分", required=True, width="medium"),
-            },
-            hide_index=True,
-            num_rows="fixed",
-            use_container_width=True,
-            key="online_products_editor",
-        )
-        st.session_state.online_df = edited.reindex(columns=MANUAL_TEMPLATE_COLUMNS)
+    headers = ["Handle", "Title", "Product Type", "Tag", "GSM", "Composition", "Price", "Width"]
+    col_widths = [1.7, 2.3, 1.3, 1.9, 0.9, 1.7, 0.9, 1.1]
+    hcols = st.columns(col_widths)
+    for j, h in enumerate(headers):
+        hcols[j].markdown(f"**{h}**")
 
-        if st.button("从在线表格生成 Matrixify Excel", type="primary", key="btn_matrixify_online"):
-            df_try = edited.reindex(columns=MANUAL_TEMPLATE_COLUMNS).copy()
-            df_try["Variant Price"] = pd.to_numeric(df_try["Variant Price"], errors="coerce")
-            v_errs = validate_manual_template_required(df_try)
-            if v_errs:
-                st.error("请补全以下必填项后再生成：\n\n" + "\n".join(v_errs))
-            else:
-                _run_matrixify(df_try, from_label="在线表格")
+    row_inputs: list[dict[str, object]] = []
+    for i in range(n_rows):
+        cols = st.columns(col_widths)
+        handle = cols[0].text_input(f"handle_{i}", label_visibility="collapsed", key=f"multi_handle_{i}")
+        title = cols[1].text_input(f"title_{i}", label_visibility="collapsed", key=f"multi_title_{i}")
+        ptype = cols[2].selectbox(f"type_{i}", type_options, index=0, label_visibility="collapsed", key=f"multi_type_{i}")
+        with cols[3]:
+            picked_labels = st.multiselect(
+                f"tag_{i}",
+                tag_options,
+                default=[],
+                label_visibility="collapsed",
+                key=f"multi_tags_{i}",
+            )
+            addon_tags = [str(t).strip() for t in picked_labels if str(t).strip()]
+            if addon_tags:
+                st.caption("已选: " + ", ".join(addon_tags))
+        gsm = cols[4].text_input(f"gsm_{i}", label_visibility="collapsed", key=f"multi_gsm_{i}")
+        comp = cols[5].text_input(f"composition_{i}", label_visibility="collapsed", key=f"multi_comp_{i}")
+        price = cols[6].number_input(
+            f"price_{i}",
+            min_value=0.0,
+            value=3.0,
+            step=0.01,
+            format="%.2f",
+            label_visibility="collapsed",
+            key=f"multi_price_{i}",
+        )
+        width = cols[7].text_input(f"width_{i}", label_visibility="collapsed", key=f"multi_width_{i}")
+        row_inputs.append(
+            {
+                "Handle": handle,
+                "Title": title,
+                "Product Type": ptype,
+                "Tag": addon_tags,
+                "GSM": gsm,
+                "Composition": comp,
+                "Variant Price": price,
+                "Metafield: custom.width [string]": width,
+            }
+        )
 
-    with tab_excel:
-        up = st.file_uploader("上传 Excel（.xlsx / .xlsm）", type=["xlsx", "xlsm"], key="upload_matrixify_excel")
-        if st.button("从上传文件生成 Matrixify Excel", type="primary", key="btn_matrixify_file"):
+    # 实时检查 Handle 重复（仅检查已填写 Handle 的行）
+    live_seen: dict[str, list[int]] = {}
+    for idx, r in enumerate(row_inputs, start=1):
+        handle_live = str(r.get("Handle", "")).strip()
+        if not handle_live:
+            continue
+        live_seen.setdefault(handle_live.lower(), []).append(idx)
+    live_dups = {h: rows for h, rows in live_seen.items() if len(rows) > 1}
+    if live_dups:
+        dup_preview = "；".join(f"{h}（行 {', '.join(str(x) for x in rows)}）" for h, rows in live_dups.items())
+        st.warning(f"检测到重复 Handle：{dup_preview}")
+
+    if st.button("生成表格", type="primary", key="btn_matrixify_multi"):
+        out_rows: list[dict[str, object]] = []
+        errs: list[str] = []
+        seen_handles: dict[str, list[int]] = {}
+        for idx, r in enumerate(row_inputs, start=1):
+            handle = str(r.get("Handle", "")).strip()
+            if not handle:
+                continue
+
+            missing_cols: list[str] = []
+            if not str(r.get("Title", "")).strip():
+                missing_cols.append("Title")
+            if not str(r.get("Product Type", "")).strip():
+                missing_cols.append("Product Type")
+            if not bool(r.get("Tag")):
+                missing_cols.append("Tag")
+            if not str(r.get("GSM", "")).strip():
+                missing_cols.append("GSM")
+            if not str(r.get("Composition", "")).strip():
+                missing_cols.append("Composition")
+            if not str(r.get("Metafield: custom.width [string]", "")).strip():
+                missing_cols.append("Width")
+            if missing_cols:
+                errs.append(f"第 {idx} 行已填写 Handle，以下字段为必填：{', '.join(missing_cols)}。")
+                continue
+
+            ptype = str(r.get("Product Type", "")).strip()
+            title = str(r.get("Title", "")).strip()
+            hkey = handle.lower()
+            seen_handles.setdefault(hkey, []).append(idx)
+            try:
+                price_val = float(r.get("Variant Price"))
+            except (TypeError, ValueError):
+                errs.append(f"第 {idx} 行 Price 必须为数值。")
+                continue
+            if price_val < 0:
+                errs.append(f"第 {idx} 行 Price 不能小于 0。")
+                continue
+            extra_tags = ", ".join(str(t).strip() for t in (r.get("Tag") or []) if str(t).strip())
+            tags = run_tag_engine(
+                product_type=ptype,
+                gsm=r.get("GSM"),
+                composition=str(r.get("Composition", "")),
+                existing_tags=extra_tags,
+            )
+            out_rows.append(
+                {
+                    "Handle": handle,
+                    "Title": title,
+                    "Type": ptype,
+                    "Tags": tags,
+                    "Variant Price": price_val,
+                    "Metafield: custom.gsm [string]": str(r.get("GSM", "")).strip(),
+                    "Metafield: custom.composition [string]": str(r.get("Composition", "")).strip(),
+                    "Metafield: custom.width [string]": str(r.get("Metafield: custom.width [string]", "")).strip(),
+                }
+            )
+        dup_msgs = []
+        for h, rows in seen_handles.items():
+            if len(rows) > 1:
+                dup_msgs.append(f"{h}（行 {', '.join(str(x) for x in rows)}）")
+        if dup_msgs:
+            errs.append("Handle 必须唯一，重复项：" + "；".join(dup_msgs))
+        if errs:
+            st.error("\n".join(errs))
+        elif not out_rows:
+            st.warning("没有检测到可导出的有效行。")
+        else:
+            _run_matrixify(pd.DataFrame(out_rows), from_label="在线多行")
+
+    st.markdown("---")
+    bottom_left, bottom_mid, bottom_right = st.columns([1.0, 1.2, 1.0])
+    with bottom_left:
+        st.subheader("批量模板下载")
+        tpl_bulk = build_bulk_import_template_dataframe()
+        st.download_button(
+            label="下载批量导入表头模板（Excel）",
+            data=to_excel_bytes(tpl_bulk),
+            file_name="Product_Bulk_Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_bulk_tpl",
+        )
+    with bottom_mid:
+        st.subheader("上传数据")
+        st.caption("Product Type 必填；若有 Tags 列会与引擎标签合并。")
+        up = st.file_uploader("选择文件（.xlsx / .xlsm）", type=["xlsx", "xlsm"], key="upload_bulk_matrixify")
+        if st.button("生成表格", type="primary", key="btn_matrixify_bulk"):
             if not up:
-                st.warning("请先选择要上传的 Excel 文件。")
+                st.warning("请先选择 Excel 文件。")
             else:
                 try:
                     raw = up.read()
-                    df = read_table_file(up.name, io.BytesIO(raw))
+                    df_raw = read_table_file(up.name, io.BytesIO(raw))
                 except Exception as e:  # noqa: BLE001
                     st.error(f"读取 Excel 失败：{e}")
                 else:
-                    _run_matrixify(df, from_label="上传文件")
-
-    b = st.session_state.get("matrixify_excel_bytes")
-    if b:
-        st.download_button(
-            label="下载 Matrixify 导入表（Excel）",
-            data=b,
-            file_name="Import_Product_Matrixify.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+                    cols_strip = [str(c).strip() for c in df_raw.columns]
+                    df_raw.columns = cols_strip
+                    type_col = "Product Type" if "Product Type" in df_raw.columns else ("Type" if "Type" in df_raw.columns else "")
+                    if not type_col:
+                        st.error("上传表缺少 Product Type 列（可用列名：`Product Type` 或 `Type`）。")
+                    else:
+                        missing_rows: list[int] = []
+                        for n, (_, row) in enumerate(df_raw.iterrows(), start=1):
+                            row_has_data = any(
+                                str(row.get(c, "")).strip() and str(row.get(c, "")).strip().lower() != "nan"
+                                for c in df_raw.columns
+                            )
+                            if not row_has_data:
+                                continue
+                            if not str(row.get(type_col, "")).strip() or str(row.get(type_col, "")).strip().lower() == "nan":
+                                missing_rows.append(n)
+                        if missing_rows:
+                            show = ", ".join(str(x) for x in missing_rows[:20])
+                            st.error(f"Product Type 为必填，以下行为空：{show}")
+                        else:
+                            can_process_bulk = True
+                            if "Variant Price" in df_raw.columns:
+                                bad_price_rows: list[int] = []
+                                for n, (_, row) in enumerate(df_raw.iterrows(), start=1):
+                                    raw_price = row.get("Variant Price")
+                                    s = str(raw_price).strip().lower()
+                                    if s in ("", "nan", "none"):
+                                        continue
+                                    try:
+                                        float(raw_price)
+                                    except (TypeError, ValueError):
+                                        bad_price_rows.append(n)
+                                if bad_price_rows:
+                                    show = ", ".join(str(x) for x in bad_price_rows[:20])
+                                    st.error(f"Variant Price 必须为数值，以下行非法：{show}")
+                                    can_process_bulk = False
+                            if can_process_bulk:
+                                df_proc = apply_tag_engine_to_bulk_dataframe(df_raw)
+                                _run_matrixify(df_proc, from_label="Excel 批量（标签引擎）")
+    with bottom_right:
+        st.subheader("表格下载")
+        b = st.session_state.get("matrixify_excel_bytes")
+        if b:
+            st.download_button(
+                label="下载表格（Excel）",
+                data=b,
+                file_name="Import_Product_Matrixify.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_matrixify_out",
+            )
+        else:
+            st.info("先生成导入表后可下载。")
     prev = st.session_state.get("matrixify_preview")
     if prev is not None and not prev.empty:
-        st.subheader("预览（前几列）")
+        st.subheader("导出预览（前几列）")
         head_cols = [
             c
-            for c in ("Handle", "Title", "Tags", "Variant SKU", "Metafield: custom.hts [string]", "Body (HTML)")
+            for c in (
+                "Handle",
+                "Title",
+                "Type",
+                "Tags",
+                "Variant SKU",
+                "Metafield: custom.hts [string]",
+                "Body (HTML)",
+            )
             if c in prev.columns
         ]
         show = prev[head_cols].head(20).copy()
